@@ -1,0 +1,10 @@
+{
+  "name": "signal-blue",
+  "colors": {
+    "sky": "#d8ecff",
+    "ink": "#10243e",
+    "accent": "#2f6fed",
+    "ok": "#168a5a"
+  },
+  "font_scale": 1.25
+}

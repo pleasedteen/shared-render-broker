@@ -1,0 +1,4 @@
+{
+  "comment": "Input fixtures are scanned by render_queue.renderer.fixture_manifest; this file is documentation and is not part of the aggregate input hash.",
+  "files": ["scene.json", "palette.json", "stamp.txt"]
+}

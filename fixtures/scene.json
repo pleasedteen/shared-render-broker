@@ -1,0 +1,9 @@
+{
+  "name": "harbor-title-card",
+  "resolution": {"width": 640, "height": 360},
+  "objects": [
+    {"kind": "background", "layer": 0, "palette": "sky"},
+    {"kind": "mark", "layer": 1, "x": 80, "y": 96, "text": "PIPELINE"},
+    {"kind": "version", "layer": 2, "x": 80, "y": 190}
+  ]
+}
