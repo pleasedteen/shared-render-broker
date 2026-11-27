@@ -61,6 +61,26 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--pipeline", required=True)
     g.add_argument("--request-id", required=True)
 
+    t = sub.add_parser(
+        "trace",
+        help="investigation trail: round claim/handoff/save events plus "
+        "delivery claim/handoff/persist/ack events for one original request",
+    )
+    t.add_argument("--pipeline", required=True)
+    t.add_argument("--request-id", required=True)
+
+    rt = sub.add_parser("round-trace", help="round-side investigation trail by round id")
+    rt.add_argument("--round-id", type=int, required=True)
+
+    rp = sub.add_parser(
+        "report-persisted",
+        help="re-report a receiver-side disk write against the original claim",
+    )
+    rp.add_argument("--subscription-id", type=int, required=True)
+    rp.add_argument("--fence", type=int, required=True)
+    rp.add_argument("--token", required=True)
+    rp.add_argument("--receiver-id", default="cli-receiver")
+
     r = sub.add_parser("revoke", help="revoke a subscription")
     r.add_argument("--pipeline", required=True)
     r.add_argument("--request-id", required=True)
@@ -102,6 +122,26 @@ def main(argv: Optional[list[str]] = None) -> int:
         request_or_exit(
             get,
             f"{base}/v1/pipelines/{quote(args.pipeline, safe='')}/requests/{quote(args.request_id, safe='')}",
+        )
+    elif args.command == "trace":
+        from urllib.parse import quote
+
+        request_or_exit(
+            get,
+            f"{base}/v1/pipelines/{quote(args.pipeline, safe='')}/requests/"
+            f"{quote(args.request_id, safe='')}/trace",
+        )
+    elif args.command == "round-trace":
+        request_or_exit(get, f"{base}/v1/rounds/{args.round_id}/trace")
+    elif args.command == "report-persisted":
+        request_or_exit(
+            post,
+            f"{base}/v1/deliveries/{args.subscription_id}/persisted",
+            {
+                "token": args.token,
+                "fence": args.fence,
+                "receiver_id": args.receiver_id,
+            },
         )
     elif args.command == "revoke":
         from urllib.parse import quote

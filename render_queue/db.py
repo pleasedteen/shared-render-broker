@@ -6,7 +6,7 @@ import contextlib
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 from .meter import WriteMeter
 
@@ -74,6 +74,60 @@ CREATE INDEX IF NOT EXISTS ix_subscriptions_pipeline_open
     ON subscriptions(pipeline_id, state, delivery_lease_expires_at, id);
 CREATE INDEX IF NOT EXISTS ix_subscriptions_round
     ON subscriptions(round_id);
+
+-- Durable investigation trail for the round (compute) side.  Every claim,
+-- lease handover and result save is recorded here and survives restarts.
+CREATE TABLE IF NOT EXISTS round_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_id INTEGER NOT NULL REFERENCES rounds(id),
+    seq INTEGER NOT NULL,
+    event_type TEXT NOT NULL CHECK (event_type IN (
+        'compute_claim', 'compute_handoff', 'result_saved'
+    )),
+    owner TEXT,
+    fence INTEGER,
+    attempt INTEGER,
+    lease_expires_at REAL,
+    detail_json TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_round_events_round
+    ON round_events(round_id, id);
+
+-- Durable investigation trail for one subscription's delivery lifecycle:
+-- delivery claims/handovers, server-side acks and receiver-side disk persists
+-- (including offline re-reports).  Rows are append-only.
+CREATE TABLE IF NOT EXISTS delivery_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    subscription_id INTEGER NOT NULL REFERENCES subscriptions(id),
+    pipeline_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    event_type TEXT NOT NULL CHECK (event_type IN (
+        'delivery_claim', 'delivery_handoff',
+        'receiver_persisted', 'delivery_acked'
+    )),
+    receiver_id TEXT,
+    fence INTEGER,
+    attempt INTEGER,
+    lease_expires_at REAL,
+    reported_by TEXT,
+    source TEXT NOT NULL DEFAULT 'live',
+    detail_json TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_delivery_events_sub
+    ON delivery_events(subscription_id, id);
+CREATE INDEX IF NOT EXISTS ix_delivery_events_pipeline
+    ON delivery_events(pipeline_id, request_id);
+
+-- At most one receiver-persisted record per original delivery claim (fence),
+-- even if the re-report is retried after a restart.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_delivery_persisted_once
+    ON delivery_events(subscription_id, fence)
+    WHERE event_type = 'receiver_persisted';
 """
 
 

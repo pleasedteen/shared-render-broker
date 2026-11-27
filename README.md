@@ -29,6 +29,11 @@ python3 verify.py
 - 投递租约续期、到期、同流水线重领且成果 SHA-256 不变；
 - 服务在成果提交事务完成后、响应发出前硬退出，重启后继续投递；
 - `acked` / `revoked` 状态及原请求号幂等重试在重启后不变；
+- 按流水线 + 原请求号排查卡单：轮次历次计算领取/换手/成果保存，与该订阅历次
+  投递领取/换手/服务端确认/接收端落盘全链路可查，重启后历史仍在；
+- 接收端离线落盘后重启按原领取补报，同一领取只显示一条落盘记录，补报不触碰
+  租约、归属、确认与撤销；
+- 确认响应丢失时按服务端已提交状态显示，并区分「服务端已确认」与「接收端已落盘」；
 - 最后一个订阅终结后，同条件新请求另起一轮；
 - 每条流水线可配置的未结订阅上限，满额只对该流水线返回 `429`；
 - 应用层增删改记录数和写入字节数计量；
@@ -86,6 +91,10 @@ python3 -m render_queue.receiver \
 `received/<pipeline>/<request-id>.rnd`，然后用租约凭据确认。处理耗时长于续期间隔
 时会自动续期。
 
+每次落盘都会写入持久 journal 并向服务端补报「接收端已落盘」；服务不可达时由后台
+重放循环和下次启动自动补报。`--offline-persist` 用于演练离线场景：接收端在成果与
+journal 落盘后、确认前直接退出，重启后自动按原领取补报并重新领取到期租约。
+
 ### 4. 提交和重试请求
 
 ```bash
@@ -117,6 +126,30 @@ python3 -m render_queue.client \
 python3 -m render_queue.client \
   --server http://127.0.0.1:8765 \
   get --pipeline demo --request-id req-0001
+```
+
+排查卡单（按流水线 + 原请求号返回完整事件链路）：
+
+```bash
+python3 -m render_queue.client \
+  --server http://127.0.0.1:8765 \
+  trace --pipeline demo --request-id req-0001
+```
+
+按轮次查看该轮所有订阅的事件链路：
+
+```bash
+python3 -m render_queue.client \
+  --server http://127.0.0.1:8765 \
+  round-trace --round-id 12
+```
+
+接收端离线落盘、重启联网后由接收进程自动补报；也可用原领取凭据手动补报：
+
+```bash
+python3 -m render_queue.client \
+  --server http://127.0.0.1:8765 \
+  report-persisted --subscription-id 7 --fence 1 --token <原领取 token>
 ```
 
 查看累计写入计量：
@@ -160,6 +193,45 @@ python3 -m render_queue.client \
 重启同一 DB 文件后，已提交的 `saved` 轮次和 `acked/revoked` 订阅仍保持原状，接收
 进程仍可领取并确认该唯一成果。
 
+确认（ack）同样支持响应丢失注入：服务在 ack 事务提交后、响应发出前 `_exit`。
+重启后排查接口与状态查询都按服务端已提交的 `acked` 状态显示，接收端用同一凭据
+重试得到幂等应答，不会产生重复确认事件。
+
+### 卡单排查与落盘补报
+
+排查数据落在两张只增不改的持久表，服务重启后仍可查询，且不暴露任何租约 token：
+
+- `round_events`（轮次侧）：`compute_claim`（首次领取）、`compute_handoff`
+  （换手，即租约到期后被其他工作进程领取）、`result_saved`（成果保存）。
+- `delivery_events`（订阅侧）：`delivery_claim`（首次投递领取）、
+  `delivery_handoff`（投递换手）、`receiver_persisted`（接收端已落盘）、
+  `delivery_acked`（服务端已确认）。
+
+排查接口：
+
+- `GET /v1/pipelines/{pipeline}/requests/{request}/trace`：按流水线 + 原请求号
+  返回所属轮次的轮次侧事件，以及该订阅的全部投递侧事件，并给出 `summary`
+  （领取/换手次数、落盘对应的领取 fence、确认数、`stuck_status` 等）。
+- `GET /v1/rounds/{id}/trace`：按轮次返回轮次侧事件及该轮每个订阅的投递侧事件。
+
+`summary.stuck_status` 明确区分两类事实：
+
+- `server_confirmed` 来自订阅行的持久状态（服务端是否已确认）；
+- `receiver_persisted` 来自接收端显式上报的落盘事件（接收端是否已落盘）。
+  例如 `persisted_pending_ack` 表示成果已在接收端磁盘、但服务端尚未确认；
+  换手前的落盘记录按当时的领取 fence 单独保留。
+
+接收端在每次落盘时先原子写成果、收据和 `.journal/` 持久日志（含原领取凭据），
+再向服务端上报 `receiver_persisted`。离线（或使用 `--offline-persist` 模拟落盘后
+断网退出）时上报留在 journal 中，重启联网后由
+`POST /v1/deliveries/{id}/persisted` 按原领取自动补报：
+
+- 部分唯一索引保证「同一订阅 + 同一领取 fence」最多一条落盘记录，重复补报返回
+  `replayed: true`，同一次领取的落盘记录始终只显示一条；
+- 补报是纯追加，不更新 `subscriptions` / `rounds`，因此不影响现有租约、投递归属，
+  也不影响订阅的确认与撤销（撤销后补报仍幂等，订阅保持 `revoked`）；
+- 补报凭据按原领取事件中的 token 校验，凭据不符返回 `401`，未知 fence 返回 `404`。
+
 ## 写入计量
 
 `render_queue/meter.py` 对所有经过 `Database` 写入助手的 INSERT/UPDATE/DELETE：
@@ -186,14 +258,17 @@ SQLite 页、WAL、checkpoint 的物理写入不在该指标内。
 
 ```text
 render_queue/
-  server.py      # HTTP/JSON API、SQLite 事务、租约、配额、故障注入
-  db.py          # schema 与带计量的 CUD 助手
+  server.py      # HTTP/JSON API、SQLite 事务、租约、配额、故障注入、卡单排查
+  db.py          # schema（含 round_events/delivery_events）与带计量的 CUD 助手
   meter.py       # 应用层写入计量
   worker.py      # 渲染工作进程
-  receiver.py    # 流水线接收/确认进程
-  client.py      # 提交、重试、撤销、查询 CLI
+  receiver.py    # 接收/确认进程、落盘 journal 与离线补报
+  client.py      # 提交、重试、撤销、查询、排查 trace、手动补报 CLI
   renderer.py    # 基于 fixtures/ 的确定性渲染
 fixtures/        # 项目自带输入夹具
 verify.py        # 端到端验证
 verify.sh        # 一条验证命令
 ```
+
+接收端的持久日志位于输出目录下的 `<output-dir>/<pipeline>/.journal/`，每个文件
+对应一次原始领取（`sub-<订阅id>-fence-<fence>.json`），记录原领取凭据与补报状态。

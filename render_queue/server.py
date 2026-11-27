@@ -95,11 +95,106 @@ def round_view(row: Any) -> Dict[str, Any]:
     return data
 
 
+def safe_round_view(row: Any) -> Dict[str, Any]:
+    """Round view with lease credentials removed for read APIs."""
+    data = round_view(row)
+    data.pop("compute_token", None)
+    return data
+
+
 def subscription_view(row: Any) -> Dict[str, Any]:
     data = dict(row)
     # Credentials are not exposed through ordinary status reads.
     data.pop("delivery_token", None)
     return data
+
+
+def _event_detail(detail: Optional[Dict[str, Any]]) -> str:
+    return canonical_json(detail or {})
+
+
+def _event_view(row: Any, *, redact: bool = True) -> Dict[str, Any]:
+    data = dict(row)
+    raw = data.pop("detail_json", "") or ""
+    try:
+        detail = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        detail = {}
+    if redact:
+        # Lease credentials must never leave the investigation API.
+        detail.pop("token", None)
+    data["detail"] = detail
+    return data
+
+
+def record_round_event(
+    tx: Any,
+    *,
+    round_id: int,
+    event_type: str,
+    now: float,
+    owner: Optional[str] = None,
+    fence: Optional[int] = None,
+    attempt: Optional[int] = None,
+    lease_expires_at: Optional[float] = None,
+    detail: Optional[Dict[str, Any]] = None,
+) -> None:
+    seq_row = tx.one("SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM round_events WHERE round_id = ?", (round_id,))
+    tx.insert(
+        "round_events",
+        {
+            "round_id": round_id,
+            "seq": int(seq_row["next_seq"]),
+            "event_type": event_type,
+            "owner": owner,
+            "fence": fence,
+            "attempt": attempt,
+            "lease_expires_at": lease_expires_at,
+            "detail_json": _event_detail(detail),
+            "created_at": now,
+        },
+    )
+
+
+def record_delivery_event(
+    tx: Any,
+    *,
+    subscription_id: int,
+    pipeline_id: str,
+    request_id: str,
+    event_type: str,
+    now: float,
+    receiver_id: Optional[str] = None,
+    fence: Optional[int] = None,
+    attempt: Optional[int] = None,
+    lease_expires_at: Optional[float] = None,
+    reported_by: Optional[str] = None,
+    source: str = "live",
+    detail: Optional[Dict[str, Any]] = None,
+) -> None:
+    seq_row = tx.one(
+        "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM delivery_events "
+        "WHERE subscription_id = ?",
+        (subscription_id,),
+    )
+    tx.insert(
+        "delivery_events",
+        {
+            "subscription_id": subscription_id,
+            "pipeline_id": pipeline_id,
+            "request_id": request_id,
+            "seq": int(seq_row["next_seq"]),
+            "event_type": event_type,
+            "receiver_id": receiver_id,
+            "fence": fence,
+            "attempt": attempt,
+            "lease_expires_at": lease_expires_at,
+            "reported_by": reported_by,
+            "source": source,
+            "detail_json": _event_detail(detail),
+            "created_at": now,
+        },
+    )
 
 
 class QueueHandler(BaseHTTPRequestHandler):
@@ -161,6 +256,18 @@ class QueueHandler(BaseHTTPRequestHandler):
                         urllib.parse.unquote(m.group(1)), urllib.parse.unquote(m.group(2))
                     )
                 )
+            elif method == "GET" and (
+                m := re.fullmatch(r"/v1/pipelines/([^/]+)/requests/([^/]+)/trace", path)
+            ):
+                self._ok(
+                    self.investigation_trace(
+                        urllib.parse.unquote(m.group(1)), urllib.parse.unquote(m.group(2))
+                    )
+                )
+            elif method == "GET" and (m := re.fullmatch(r"/v1/rounds/(\d+)/trace", path)):
+                self._ok(self.round_trace(int(m.group(1))))
+            elif method == "POST" and (m := re.fullmatch(r"/v1/deliveries/(\d+)/persisted", path)):
+                self._ok(self.report_persisted(int(m.group(1)), _parse_json_object(self)))
             elif method == "POST" and path == "/v1/subscriptions":
                 created = self.create_subscription(_parse_json_object(self))
                 self._ok(created, status=200 if created.get("replayed") else 201)
@@ -272,14 +379,14 @@ class QueueHandler(BaseHTTPRequestHandler):
         sql += " ORDER BY id DESC LIMIT 100"
         with self.server.db.tx() as tx:
             rows = tx.all(sql, params)
-        return {"rounds": [round_view(r) for r in rows]}
+        return {"rounds": [safe_round_view(r) for r in rows]}
 
     def get_round(self, round_id: int) -> Dict[str, Any]:
         with self.server.db.tx() as tx:
             row = tx.one("SELECT * FROM rounds WHERE id = ?", (round_id,))
         if row is None:
             raise ApiError(404, "round_not_found", f"round {round_id} not found")
-        return {"round": round_view(row)}
+        return {"round": safe_round_view(row)}
 
     def get_subscription(self, sub_id: int) -> Dict[str, Any]:
         with self.server.db.tx() as tx:
@@ -287,7 +394,7 @@ class QueueHandler(BaseHTTPRequestHandler):
             if row is None:
                 raise ApiError(404, "subscription_not_found", f"subscription {sub_id} not found")
             rnd = tx.one("SELECT * FROM rounds WHERE id = ?", (row["round_id"],))
-        return {"subscription": subscription_view(row), "round": round_view(rnd)}
+        return {"subscription": subscription_view(row), "round": safe_round_view(rnd)}
 
     def get_named_subscription(self, pipeline: str, request_id: str) -> Dict[str, Any]:
         with self.server.db.tx() as tx:
@@ -302,7 +409,240 @@ class QueueHandler(BaseHTTPRequestHandler):
                     f"{pipeline}/{request_id} not found",
                 )
             rnd = tx.one("SELECT * FROM rounds WHERE id = ?", (row["round_id"],))
-        return {"subscription": subscription_view(row), "round": round_view(rnd)}
+        return {"subscription": subscription_view(row), "round": safe_round_view(rnd)}
+
+    # ----- stuck-ticket investigation --------------------------------------
+
+    @staticmethod
+    def _round_events_with_saved_fallback(tx: Any, round_id: int) -> list[Dict[str, Any]]:
+        """Return durable round events, synthesising a lost save event if needed."""
+        rows = tx.all(
+            "SELECT * FROM round_events WHERE round_id = ? ORDER BY id",
+            (round_id,),
+        )
+        events = [_event_view(r) for r in rows]
+        has_save = any(e["event_type"] == "result_saved" for e in events)
+        if not has_save:
+            rnd = tx.one("SELECT * FROM rounds WHERE id = ?", (round_id,))
+            if rnd is not None and rnd["state"] in ("saved", "closed") and rnd["submitted_at"] is not None:
+                # Defensive fallback: the save transaction is durable even when
+                # its separate event transaction was interrupted by a crash.
+                events.append(
+                    {
+                        "id": None,
+                        "round_id": round_id,
+                        "seq": len(events) + 1,
+                        "event_type": "result_saved",
+                        "owner": rnd["compute_owner"],
+                        "fence": rnd["compute_fence"],
+                        "attempt": rnd["compute_attempts"],
+                        "lease_expires_at": None,
+                        "created_at": rnd["submitted_at"],
+                        "detail": {
+                            "result_sha256": rnd["result_sha256"],
+                            "result_bytes": rnd["result_bytes"],
+                            "content_type": rnd["result_content_type"],
+                            "synthesized": True,
+                        },
+                    }
+                )
+        return events
+
+    def investigation_trace(self, pipeline: str, request_id: str) -> Dict[str, Any]:
+        with self.server.db.tx() as tx:
+            sub = tx.one(
+                "SELECT * FROM subscriptions WHERE pipeline_id = ? AND request_id = ?",
+                (pipeline, request_id),
+            )
+            if sub is None:
+                raise ApiError(
+                    404,
+                    "subscription_not_found",
+                    f"{pipeline}/{request_id} not found",
+                )
+            rnd = tx.one("SELECT * FROM rounds WHERE id = ?", (sub["round_id"],))
+            round_events = self._round_events_with_saved_fallback(tx, int(sub["round_id"]))
+            delivery_rows = tx.all(
+                "SELECT * FROM delivery_events WHERE subscription_id = ? ORDER BY id",
+                (sub["id"],),
+            )
+            delivery_events = [_event_view(r) for r in delivery_rows]
+
+        persisted = [e for e in delivery_events if e["event_type"] == "receiver_persisted"]
+        acked = [e for e in delivery_events if e["event_type"] == "delivery_acked"]
+        claims = [
+            e
+            for e in delivery_events
+            if e["event_type"] in ("delivery_claim", "delivery_handoff")
+        ]
+        handovers = [e for e in claims if e["event_type"] == "delivery_handoff"]
+        compute_handovers = [e for e in round_events if e["event_type"] == "compute_handoff"]
+
+        # Server-side confirmation is the subscription row's durable state;
+        # receiver-side persistence is a separate, explicitly reported fact.
+        server_confirmed = sub["state"] == "acked"
+        receiver_persisted = len(persisted) > 0
+        if server_confirmed and receiver_persisted:
+            stuck_status = "complete"
+        elif receiver_persisted:
+            # The artifact is safely on the receiver's disk while the server
+            # still shows no confirmation: this is exactly the re-report /
+            # pending-ack window an investigator needs to see.
+            stuck_status = "persisted_pending_ack"
+        elif server_confirmed:
+            stuck_status = "server_acked_without_persist_report"
+        else:
+            stuck_status = "in_flight"
+
+        return {
+            "query": {"pipeline_id": pipeline, "request_id": request_id},
+            "subscription": subscription_view(sub),
+            "round": safe_round_view(rnd),
+            "round_events": round_events,
+            "delivery_events": delivery_events,
+            "summary": {
+                "stuck_status": stuck_status,
+                "server_confirmed": server_confirmed,
+                "receiver_persisted": receiver_persisted,
+                "delivery_claim_count": len(claims),
+                "delivery_handoff_count": len(handovers),
+                "compute_handoff_count": len(compute_handovers),
+                "persisted_claim_fences": sorted(int(e["fence"]) for e in persisted),
+                "ack_event_count": len(acked),
+                "persisted_event_count": len(persisted),
+            },
+        }
+
+    def round_trace(self, round_id: int) -> Dict[str, Any]:
+        with self.server.db.tx() as tx:
+            rnd = tx.one("SELECT * FROM rounds WHERE id = ?", (round_id,))
+            if rnd is None:
+                raise ApiError(404, "round_not_found", f"round {round_id} not found")
+            round_events = self._round_events_with_saved_fallback(tx, round_id)
+            subs = tx.all(
+                "SELECT * FROM subscriptions WHERE round_id = ? ORDER BY id",
+                (round_id,),
+            )
+            sub_traces: list[Dict[str, Any]] = []
+            for sub in subs:
+                events = [
+                    _event_view(r)
+                    for r in tx.all(
+                        "SELECT * FROM delivery_events WHERE subscription_id = ? ORDER BY id",
+                        (sub["id"],),
+                    )
+                ]
+                sub_traces.append(
+                    {
+                        "subscription": subscription_view(sub),
+                        "delivery_events": events,
+                    }
+                )
+        return {
+            "query": {"round_id": round_id},
+            "round": safe_round_view(rnd),
+            "round_events": round_events,
+            "subscriptions": sub_traces,
+        }
+
+    def report_persisted(self, sub_id: int, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Receiver re-report: the original claim's artifact hit local disk.
+
+        This endpoint is a pure append to delivery_events.  It never touches
+        leases, delivery ownership, or the subscription's ack/revoke state, and
+        the unique index guarantees one persisted row per original claim fence.
+        """
+        token = _require_string(body, "token")
+        fence = body.get("fence")
+        if not isinstance(fence, int) or fence <= 0:
+            raise ApiError(400, "invalid_field", "fence must be a positive integer")
+        receiver_id = _require_string(body, "receiver_id", "reported_by")
+        persisted_at = body.get("persisted_at")
+        if persisted_at is not None and not isinstance(persisted_at, (int, float)):
+            raise ApiError(400, "invalid_field", "persisted_at must be a number")
+        sha = body.get("sha256")
+        if sha is not None and not isinstance(sha, str):
+            raise ApiError(400, "invalid_field", "sha256 must be a string")
+        now = _now()
+        detail: Dict[str, Any] = {}
+        if sha:
+            detail["sha256"] = sha
+        if persisted_at is not None:
+            detail["persisted_at"] = float(persisted_at)
+
+        with self.server.db.tx() as tx:
+            sub = tx.one("SELECT * FROM subscriptions WHERE id = ?", (sub_id,))
+            if sub is None:
+                raise ApiError(
+                    404, "subscription_not_found", f"delivery {sub_id} not found"
+                )
+            # The re-report authenticates against the original claim's recorded
+            # credential, not the current lease: lease expiry/handoff must not
+            # block an offline receiver from reporting its disk write.
+            claim_event = tx.one(
+                "SELECT * FROM delivery_events "
+                "WHERE subscription_id = ? AND fence = ? "
+                "AND event_type IN ('delivery_claim', 'delivery_handoff') "
+                "ORDER BY id DESC LIMIT 1",
+                (sub_id, fence),
+            )
+            if claim_event is None:
+                raise ApiError(
+                    404,
+                    "claim_not_found",
+                    f"no delivery claim with fence {fence} for subscription {sub_id}",
+                )
+            try:
+                claim_detail = json.loads(claim_event["detail_json"] or "{}")
+            except json.JSONDecodeError:
+                claim_detail = {}
+            if claim_detail.get("token") != token:
+                raise ApiError(
+                    401,
+                    "invalid_credential",
+                    "persisted report token does not match the original delivery claim",
+                )
+
+            duplicate = tx.one(
+                "SELECT * FROM delivery_events "
+                "WHERE subscription_id = ? AND fence = ? AND event_type = 'receiver_persisted'",
+                (sub_id, fence),
+            )
+            if duplicate is not None:
+                # Same original claim reported again (e.g. receiver restarted
+                # twice): return the existing row without writing anything.
+                return {
+                    "replayed": True,
+                    "event": _event_view(duplicate),
+                    "subscription_state": sub["state"],
+                }
+
+            record_delivery_event(
+                tx,
+                subscription_id=int(sub["id"]),
+                pipeline_id=sub["pipeline_id"],
+                request_id=sub["request_id"],
+                event_type="receiver_persisted",
+                now=now,
+                receiver_id=claim_event["receiver_id"],
+                fence=fence,
+                attempt=claim_event["attempt"],
+                lease_expires_at=claim_event["lease_expires_at"],
+                reported_by=receiver_id,
+                source="rereport",
+                detail=detail,
+            )
+            event = tx.one(
+                "SELECT * FROM delivery_events WHERE id = last_insert_rowid()"
+            )
+            sub_after = tx.one(
+                "SELECT * FROM subscriptions WHERE id = ?", (sub_id,)
+            )
+        return {
+            "replayed": False,
+            "event": _event_view(event),
+            "subscription_state": sub_after["state"],
+        }
 
     # ----- subscriptions ----------------------------------------------------
 
@@ -334,7 +674,7 @@ class QueueHandler(BaseHTTPRequestHandler):
                 return {
                     "replayed": True,
                     "subscription": subscription_view(existing),
-                    "round": round_view(rnd),
+                    "round": safe_round_view(rnd),
                 }
 
             open_count = tx.one(
@@ -408,7 +748,7 @@ class QueueHandler(BaseHTTPRequestHandler):
         return {
             "replayed": False,
             "subscription": subscription_view(sub),
-            "round": round_view(rnd),
+            "round": safe_round_view(rnd),
             "quota": {"limit": limit},
         }
 
@@ -422,14 +762,14 @@ class QueueHandler(BaseHTTPRequestHandler):
                 raise ApiError(404, "subscription_not_found", f"{pipeline}/{request_id} not found")
             if sub["state"] == "revoked":
                 rnd = tx.one("SELECT * FROM rounds WHERE id = ?", (sub["round_id"],))
-                return {"replayed": True, "subscription": subscription_view(sub), "round": round_view(rnd)}
+                return {"replayed": True, "subscription": subscription_view(sub), "round": safe_round_view(rnd)}
             if sub["state"] == "acked":
                 rnd = tx.one("SELECT * FROM rounds WHERE id = ?", (sub["round_id"],))
                 raise ApiError(
                     409,
                     "subscription_already_acked",
                     "acknowledged subscription cannot be revoked",
-                    {"subscription": subscription_view(sub), "round": round_view(rnd)},
+                    {"subscription": subscription_view(sub), "round": safe_round_view(rnd)},
                 )
 
             now = _now()
@@ -442,7 +782,7 @@ class QueueHandler(BaseHTTPRequestHandler):
             self._close_round_if_last(tx, int(sub["round_id"]), now)
             sub = tx.one("SELECT * FROM subscriptions WHERE id = ?", (sub["id"],))
             rnd = tx.one("SELECT * FROM rounds WHERE id = ?", (sub["round_id"],))
-        return {"subscription": subscription_view(sub), "round": round_view(rnd)}
+        return {"subscription": subscription_view(sub), "round": safe_round_view(rnd)}
 
     @staticmethod
     def _close_round_if_last(tx: Any, round_id: int, now: float) -> None:
@@ -500,6 +840,22 @@ class QueueHandler(BaseHTTPRequestHandler):
                 return {"delivery": None}
 
             sub = tx.one("SELECT * FROM subscriptions WHERE id = ?", (row["id"],))
+            event_type = (
+                "delivery_claim" if int(sub["delivery_fence"]) == 1 else "delivery_handoff"
+            )
+            record_delivery_event(
+                tx,
+                subscription_id=int(sub["id"]),
+                pipeline_id=sub["pipeline_id"],
+                request_id=sub["request_id"],
+                event_type=event_type,
+                now=now,
+                receiver_id=receiver,
+                fence=int(sub["delivery_fence"]),
+                attempt=int(sub["delivery_attempts"]),
+                lease_expires_at=expires,
+                detail={"token": token, "lease_seconds": lease_seconds},
+            )
             rnd = tx.one("SELECT * FROM rounds WHERE id = ?", (sub["round_id"],))
             result_body = bytes(rnd["result_body"])
 
@@ -580,7 +936,7 @@ class QueueHandler(BaseHTTPRequestHandler):
 
             if sub["state"] == "acked":
                 rnd = tx.one("SELECT * FROM rounds WHERE id = ?", (sub["round_id"],))
-                return {"replayed": True, "subscription": subscription_view(sub), "round": round_view(rnd)}
+                return {"replayed": True, "subscription": subscription_view(sub), "round": safe_round_view(rnd)}
             if sub["state"] == "revoked":
                 raise ApiError(
                     409,
@@ -596,9 +952,35 @@ class QueueHandler(BaseHTTPRequestHandler):
                 (sub_id,),
             )
             self._close_round_if_last(tx, int(sub["round_id"]), now)
+            record_delivery_event(
+                tx,
+                subscription_id=int(sub["id"]),
+                pipeline_id=sub["pipeline_id"],
+                request_id=sub["request_id"],
+                event_type="delivery_acked",
+                now=now,
+                receiver_id=sub["delivery_owner"],
+                fence=int(sub["delivery_fence"]),
+                attempt=int(sub["delivery_attempts"]),
+                detail={"ack_origin": "live"},
+            )
+            fault_now = self.server.faults.take(
+                "crash_before_ack_response", {"subscription_id": sub_id}
+            )
             sub = tx.one("SELECT * FROM subscriptions WHERE id = ?", (sub_id,))
             rnd = tx.one("SELECT * FROM rounds WHERE id = ?", (sub["round_id"],))
-        return {"subscription": subscription_view(sub), "round": round_view(rnd)}
+
+        if fault_now:
+            print(
+                f"FAULT: committed ack for subscription {sub_id}; exiting before HTTP response",
+                flush=True,
+            )
+            # The ack (and its event row) are already durable; this simulates a
+            # lost confirmation response followed by a hard restart.
+            import os
+
+            os._exit(88)
+        return {"subscription": subscription_view(sub), "round": safe_round_view(rnd)}
 
     # ----- computation leases ----------------------------------------------
 
@@ -640,6 +1022,20 @@ class QueueHandler(BaseHTTPRequestHandler):
             )
             if updated != 1:
                 return {"job": None}
+            rnd = tx.one("SELECT * FROM rounds WHERE id = ?", (row["id"],))
+            record_round_event(
+                tx,
+                round_id=int(rnd["id"]),
+                event_type=(
+                    "compute_claim" if int(rnd["compute_fence"]) == 1 else "compute_handoff"
+                ),
+                now=now,
+                owner=worker,
+                fence=int(rnd["compute_fence"]),
+                attempt=int(rnd["compute_attempts"]),
+                lease_expires_at=expires,
+                detail={"token": token, "lease_seconds": lease_seconds},
+            )
             rnd = tx.one("SELECT * FROM rounds WHERE id = ?", (row["id"],))
 
         return {
@@ -723,16 +1119,16 @@ class QueueHandler(BaseHTTPRequestHandler):
                         409,
                         "result_already_saved",
                         "a different compute attempt already saved this round",
-                        {"round": round_view(rnd)},
+                        {"round": safe_round_view(rnd)},
                     )
                 if rnd["compute_lease_expires_at"] is None or rnd["compute_lease_expires_at"] <= now:
                     raise ApiError(
                         410,
                         "lease_expired",
                         "credential expired; saved result was retained",
-                        {"round": round_view(rnd)},
+                        {"round": safe_round_view(rnd)},
                     )
-                return {"replayed": True, "round": round_view(rnd)}
+                return {"replayed": True, "round": safe_round_view(rnd)}
 
             if rnd["state"] == "closed":
                 raise ApiError(409, "round_closed", "all subscriptions ended before result submission")
@@ -767,19 +1163,45 @@ class QueueHandler(BaseHTTPRequestHandler):
                 "crash_before_submit_response", {"round_id": round_id}
             )
 
+        # The investigation event is appended in its own transaction so the
+        # completion write above stays exactly one rounds row regardless of
+        # subscription count and of event bookkeeping.
+        with self.server.db.tx() as tx:
+            saved_row = tx.one("SELECT * FROM rounds WHERE id = ?", (round_id,))
+            already = tx.one(
+                "SELECT 1 FROM round_events WHERE round_id = ? AND event_type = 'result_saved'",
+                (round_id,),
+            )
+            if already is None:
+                record_round_event(
+                    tx,
+                    round_id=round_id,
+                    event_type="result_saved",
+                    now=float(saved_row["submitted_at"] or now),
+                    owner=saved_row["compute_owner"],
+                    fence=int(saved_row["compute_fence"]),
+                    attempt=int(saved_row["compute_attempts"]),
+                    detail={
+                        "result_sha256": digest,
+                        "result_bytes": len(result_body),
+                        "content_type": content_type,
+                    },
+                )
+
         if fault_now:
             print(
                 f"FAULT: committed result for round {round_id}; exiting before HTTP response",
                 flush=True,
             )
-            # Commit is already durable.  Simulates response loss / hard restart.
+            # Commit (plus its investigation event) is already durable.
+            # Simulates response loss / hard restart.
             import os
 
             os._exit(87)
 
         with self.server.db.tx() as tx:
             rnd = tx.one("SELECT * FROM rounds WHERE id = ?", (round_id,))
-        return {"replayed": False, "round": round_view(rnd)}
+        return {"replayed": False, "round": safe_round_view(rnd)}
 
     # ----- faults -----------------------------------------------------------
 

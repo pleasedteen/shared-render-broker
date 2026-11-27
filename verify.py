@@ -242,6 +242,7 @@ def main() -> int:
         )
         completion_bytes: Dict[int, int] = {}
         completion_records: Dict[int, int] = {}
+        round_completion_bytes: Dict[int, int] = {}
         benchmark_round_id: Optional[int] = None
         benchmark_params = {"benchmark": "write-independence", "fixed_inputs": True}
         for n in (1, 6, 20):
@@ -278,11 +279,22 @@ def main() -> int:
             wm = saved["request_write_metrics"]
             completion_bytes[n] = int(wm["app_value_bytes"])
             completion_records[n] = int(wm["records_affected"])
-            check(wm["records_affected"] == 1, f"N={n}: completion affects one record", wm["by_table"])
+            rounds_stats = wm["by_table"]["rounds"]
+            round_completion_bytes[n] = int(rounds_stats["app_value_bytes"])
             check(
-                set(wm["by_table"].keys()) == {"rounds"},
-                f"N={n}: no subscription fanout writes",
+                rounds_stats["records_affected"] == 1,
+                f"N={n}: completion transaction writes one rounds record",
+                rounds_stats,
+            )
+            check(
+                "subscriptions" not in wm["by_table"],
+                f"N={n}: no subscription fanout writes on result save",
                 sorted(wm["by_table"].keys()),
+            )
+            check(
+                wm["by_table"].get("round_events", {}).get("records_affected", 0) <= 1,
+                f"N={n}: save adds at most one round audit event",
+                wm["by_table"].get("round_events"),
             )
 
             if n == 20:
@@ -316,11 +328,14 @@ def main() -> int:
             completion_records,
         )
         check(
-            len(set(completion_bytes.values())) == 1,
-            "completion application-value bytes stay constant as open subscriptions increase",
-            completion_bytes,
+            len(set(round_completion_bytes.values())) == 1,
+            "rounds-row completion application-value bytes stay constant as open subscriptions increase",
+            round_completion_bytes,
         )
-        ok("fixed artifact/inputs: one rounds-row write, independent of subscription count", f"bytes={completion_bytes[1]}")
+        ok(
+            "fixed artifact/inputs: one rounds-row write, independent of subscription count",
+            f"rounds_bytes={next(iter(round_completion_bytes.values()))}",
+        )
 
         section("4. Shared computation and receiver backlog")
         procs.start(
@@ -957,7 +972,481 @@ def main() -> int:
         recovery_receipt = json.loads((run_dir / "received" / "recovery" / "recover-1.receipt.json").read_text())
         check(recovery_receipt["sha256"] == recovered_round["result_sha256"], "post-restart delivery has the same saved result")
 
-        section("10. Cumulative write meter")
+        section("10. Stuck-ticket investigation trace, offline persist and re-report")
+
+        def trace_of(pipeline: str, request_id: str) -> Dict[str, Any]:
+            _, payload, _ = api.get(
+                f"/v1/pipelines/{pipeline}/requests/{request_id}/trace"
+            )
+            return payload
+
+        def event_types(events: list[Dict[str, Any]]) -> list[str]:
+            return [e["event_type"] for e in events]
+
+        def find_token_keys(value: Any, path: str = "") -> list[str]:
+            hits: list[str] = []
+            if isinstance(value, dict):
+                for key, sub in value.items():
+                    if "token" in str(key):
+                        hits.append(f"{path}.{key}")
+                    hits.extend(find_token_keys(sub, f"{path}.{key}"))
+            elif isinstance(value, list):
+                for index, sub in enumerate(value):
+                    hits.extend(find_token_keys(sub, f"{path}[{index}]"))
+            return hits
+
+        # 10a. The shared round from section 4 already carries a full durable
+        # round-side and delivery-side trail, queryable by pipeline + original
+        # request number.
+        shared_trace = wait_until(
+            lambda: (
+                lambda p: p
+                if {"compute_claim", "result_saved"}.issubset(
+                    set(event_types(p["round_events"]))
+                )
+                and any(
+                    e["event_type"] == "delivery_acked" for e in p["delivery_events"]
+                )
+                else None
+            )(trace_of("backlog", "shared-0")),
+            8,
+            "shared-0 trace shows compute claim/save and delivery ack",
+        )
+        check(
+            event_types(shared_trace["round_events"])[0] == "compute_claim",
+            "round trail begins with a compute claim",
+            event_types(shared_trace["round_events"]),
+        )
+        check(
+            any(e["event_type"] == "result_saved" for e in shared_trace["round_events"]),
+            "round trail records the result save",
+        )
+        shared_delivery_types = event_types(shared_trace["delivery_events"])
+        check(
+            shared_delivery_types[0] == "delivery_claim",
+            "subscription trail begins with a delivery claim",
+            shared_delivery_types,
+        )
+        check(
+            "delivery_acked" in shared_delivery_types
+            and "receiver_persisted" in shared_delivery_types,
+            "trail distinguishes server ack from receiver disk persist",
+            shared_delivery_types,
+        )
+        check(
+            shared_trace["summary"]["server_confirmed"] is True
+            and shared_trace["summary"]["receiver_persisted"] is True
+            and shared_trace["summary"]["stuck_status"] == "complete",
+            "summary separates server-confirmed and receiver-persisted facts",
+            shared_trace["summary"],
+        )
+        check(
+            all("token" not in e["detail"] for e in shared_trace["round_events"] + shared_trace["delivery_events"]),
+            "investigation event details never leak lease credentials",
+        )
+        check(
+            find_token_keys(shared_trace) == [],
+            "the whole trace payload (including round/subscription rows) is credential-free",
+            find_token_keys(shared_trace),
+        )
+
+        # The same investigation data is reachable through the round-wide view.
+        _, round_trace_payload, _ = api.get(f"/v1/rounds/{shared_round_id}/trace")
+        check(
+            len(round_trace_payload["subscriptions"]) == 8,
+            "round trace lists every pipeline subscription of the round",
+            len(round_trace_payload["subscriptions"]),
+        )
+        check(
+            any(e["event_type"] == "result_saved" for e in round_trace_payload["round_events"]),
+            "round trace contains the save event",
+        )
+        check(
+            find_token_keys(round_trace_payload) == [],
+            "round-wide trace is credential-free as well",
+            find_token_keys(round_trace_payload),
+        )
+
+        # 10b. Compute handover is visible in the round trail as its own event.
+        check(
+            any(e["event_type"] == "compute_handoff" for e in trace_of("takeover", "takeover-1")["round_events"]),
+            "compute lease handover is recorded per round",
+        )
+        check(
+            trace_of("takeover", "takeover-1")["summary"]["compute_handoff_count"] >= 1,
+            "handoff count surfaced in summary",
+        )
+
+        # 10c. A receiver persists while offline: it hard-exits after the
+        # artifact and journal are durable and never acks.
+        _, offline_case, _ = api.post(
+            "/v1/subscriptions",
+            {
+                "pipeline_id": "trace-demo",
+                "request_id": "offline-persist-1",
+                "asset_id": "harbor-title",
+                "asset_version": "5.0.0",
+                "params": {"case": "offline-persist"},
+            },
+        )
+        persist_sub_id = int(offline_case["subscription"]["id"])
+        persist_round = int(offline_case["subscription"]["round_id"])
+        wait_until(
+            lambda: api.get(f"/v1/rounds/{persist_round}")[1]["round"]["state"] == "saved",
+            8,
+            "offline-persist round saved",
+        )
+        procs.start(
+            "receiver-offline-persist",
+            "render_queue.receiver",
+            [
+                "--server",
+                api.base,
+                "--pipeline-id",
+                "trace-demo",
+                "--receiver-id",
+                "offline-persister",
+                "--output-dir",
+                str(run_dir / "received2"),
+                "--poll-interval",
+                "0.05",
+                "--lease-seconds",
+                "1.5",
+                "--offline-persist",
+            ],
+        )
+        procs.wait_log("receiver-offline-persist", "event=offline_persist_exit", 10)
+        wait_until(
+            lambda: procs.poll("receiver-offline-persist") is not None,
+            5,
+            "offline receiver process exited",
+        )
+        artifact = run_dir / "received2" / "trace-demo" / "offline-persist-1.rnd"
+        check(artifact.exists(), "offline receiver wrote the artifact before exiting")
+        journal_entries = list(
+            (run_dir / "received2" / "trace-demo" / ".journal").glob("sub-*.json")
+        )
+        check(len(journal_entries) == 1, "one durable journal entry survived the exit", len(journal_entries))
+        journal = json.loads(journal_entries[0].read_text())
+        check(
+            int(journal["subscription_id"]) == persist_sub_id
+            and isinstance(journal.get("token"), str)
+            and int(journal["fence"]) >= 1,
+            "journal durably keeps the original claim credential and fence",
+        )
+        check(journal.get("reported") is False, "offline receiver leaves the persist report pending for replay")
+
+        # The offline receiver never contacted the persist endpoint, so the
+        # server-side trail has the claim but no persisted row yet; leases and
+        # ownership are likewise untouched.
+        pre_trace = trace_of("trace-demo", "offline-persist-1")
+        check(named_state("trace-demo", "offline-persist-1") == "open", "offline persist does not ack the subscription")
+        check(
+            pre_trace["subscription"]["delivery_owner"] == "offline-persister"
+            and int(pre_trace["subscription"]["delivery_fence"]) == int(journal["fence"]),
+            "offline exit does not change delivery ownership or lease fence",
+            pre_trace["subscription"]["delivery_owner"],
+        )
+        check(
+            pre_trace["summary"]["server_confirmed"] is False
+            and pre_trace["summary"]["receiver_persisted"] is False
+            and pre_trace["summary"]["persisted_event_count"] == 0,
+            "no server-side persisted row before the reconnect re-report",
+            pre_trace["summary"],
+        )
+
+        # 10d. Re-report authentication: only the original claim's credential
+        # and an existing claim fence are accepted.  No row is written yet.
+        bad_token = api.expect_error(
+            "POST",
+            f"/v1/deliveries/{persist_sub_id}/persisted",
+            {"token": "not-the-original-token", "fence": int(journal["fence"]), "receiver_id": "x"},
+        )
+        check(bad_token.status == 401, "re-report with a foreign token is rejected", bad_token.code)
+        bad_fence = api.expect_error(
+            "POST",
+            f"/v1/deliveries/{persist_sub_id}/persisted",
+            {"token": journal["token"], "fence": 9999, "receiver_id": "x"},
+        )
+        check(bad_fence.status == 404, "re-report for an unknown claim fence is rejected", bad_fence.code)
+        check(
+            trace_of("trace-demo", "offline-persist-1")["summary"]["persisted_event_count"] == 0,
+            "rejected re-reports write no trail rows",
+        )
+
+        # 10e. The restarted receiver replays the journal against the original
+        # claim (first replay creates the single persisted row), then the
+        # expired lease is re-claimed (handover) and normally acked — leases,
+        # ownership and terminal states stay intact.
+        procs.start(
+            "receiver-offline-back",
+            "render_queue.receiver",
+            [
+                "--server",
+                api.base,
+                "--pipeline-id",
+                "trace-demo",
+                "--receiver-id",
+                "offline-persister",
+                "--output-dir",
+                str(run_dir / "received2"),
+                "--poll-interval",
+                "0.05",
+                "--lease-seconds",
+                "5",
+                "--replay-interval",
+                "0.5",
+            ],
+        )
+        procs.wait_log("receiver-offline-back", "event=journal_replay_start", 8)
+        replay_log = procs.wait_log(
+            "receiver-offline-back",
+            "event=persist_reported",
+            8,
+        )
+        check(
+            f"sub_id={persist_sub_id}" in replay_log and "replayed=False" in replay_log,
+            "restart re-reports the offline disk write against the original claim",
+        )
+        # The local journal entry is reconciled once the server accepts it.
+        wait_until(
+            lambda: all(
+                json.loads(p.read_text()).get("reported")
+                for p in (run_dir / "received2" / "trace-demo" / ".journal").glob("sub-*.json")
+            ),
+            5,
+            "journal entry marked reported after replay",
+        )
+        replayed_trace = trace_of("trace-demo", "offline-persist-1")
+        check(
+            replayed_trace["summary"]["persisted_event_count"] == 1
+            and replayed_trace["summary"]["persisted_claim_fences"] == [int(journal["fence"])]
+            and replayed_trace["summary"]["stuck_status"] == "persisted_pending_ack",
+            "reconnect re-report yields exactly one persisted row, still pending ack",
+            replayed_trace["summary"],
+        )
+        check(
+            replayed_trace["subscription"]["state"] == "open",
+            "re-report never acks, revokes or otherwise changes the subscription",
+        )
+        # Replaying the same journal once more must be a no-op on the server.
+        _, replay_again, _ = api.post(
+            f"/v1/deliveries/{persist_sub_id}/persisted",
+            {
+                "token": journal["token"],
+                "fence": int(journal["fence"]),
+                "receiver_id": "offline-persister",
+            },
+        )
+        check(replay_again.get("replayed") is True, "repeated re-report of the same claim is idempotent")
+        check(
+            trace_of("trace-demo", "offline-persist-1")["summary"]["persisted_event_count"] == 1,
+            "idempotent re-report adds no duplicate row",
+        )
+        wait_until(
+            lambda: named_state("trace-demo", "offline-persist-1") == "acked",
+            10,
+            "restarted receiver re-claims after lease expiry and acks",
+        )
+        final_trace = trace_of("trace-demo", "offline-persist-1")
+        final_types = event_types(final_trace["delivery_events"])
+        persisted_fences = [
+            int(e["fence"])
+            for e in final_trace["delivery_events"]
+            if e["event_type"] == "receiver_persisted"
+        ]
+        claim_fences = [
+            int(e["fence"])
+            for e in final_trace["delivery_events"]
+            if e["event_type"] in ("delivery_claim", "delivery_handoff")
+        ]
+        check(
+            len(persisted_fences) == len(set(persisted_fences)),
+            "each original claim shows its persist record at most once",
+            persisted_fences,
+        )
+        check(
+            sorted(persisted_fences) == sorted(set(persisted_fences) & set(claim_fences))
+            and len(persisted_fences) == len(claim_fences),
+            "one persist row per claim fence, including the pre-handover claim",
+            {"persisted": persisted_fences, "claims": claim_fences},
+        )
+        check(
+            "delivery_handoff" in final_types and "delivery_acked" in final_types,
+            "trail shows handover then server confirmation",
+            final_types,
+        )
+        check(
+            final_trace["summary"]["delivery_handoff_count"] >= 1,
+            "delivery handover counted in summary",
+        )
+
+        # 10f. Re-report isolation extends to revocation: persist rows are
+        # append-only audit data and never resurrect or alter a revoked
+        # subscription.  A dedicated pipeline and unique round key keep other
+        # polling receivers away from this subscription.
+        _, iso_req, _ = api.post(
+            "/v1/subscriptions",
+            {
+                "pipeline_id": "iso-demo",
+                "request_id": "revoke-isolation-1",
+                "asset_id": "iso-asset",
+                "asset_version": "9.9.9",
+                "params": {"case": "rereport-revoke-isolation", "unique": "iso"},
+            },
+        )
+        iso_sub_id = int(iso_req["subscription"]["id"])
+        iso_round = int(iso_req["subscription"]["round_id"])
+        wait_until(
+            lambda: api.get(f"/v1/rounds/{iso_round}")[1]["round"]["state"] == "saved",
+            20,
+            "revoke-isolation round saved",
+        )
+        _, iso_claim, _ = api.post(
+            "/v1/deliveries/claim",
+            {"pipeline_id": "iso-demo", "receiver_id": "iso-recv", "lease_seconds": 20},
+        )
+        iso_delivery = iso_claim["delivery"]
+        check(
+            iso_delivery is not None and int(iso_delivery["subscription_id"]) == iso_sub_id,
+            "dedicated pipeline delivery claimed for the isolation case",
+        )
+        api.post(
+            f"/v1/deliveries/{iso_sub_id}/persisted",
+            {
+                "token": iso_delivery["lease"]["token"],
+                "fence": int(iso_delivery["lease"]["fence"]),
+                "receiver_id": "iso-recv",
+                "sha256": iso_delivery["result"]["sha256"],
+            },
+        )
+        _, iso_revoke, _ = api.post(
+            "/v1/pipelines/iso-demo/requests/revoke-isolation-1/revoke", {}
+        )
+        check(iso_revoke["subscription"]["state"] == "revoked", "subscription revoked while a persisted row exists")
+        _, iso_rereport, _ = api.post(
+            f"/v1/deliveries/{iso_sub_id}/persisted",
+            {
+                "token": iso_delivery["lease"]["token"],
+                "fence": int(iso_delivery["lease"]["fence"]),
+                "receiver_id": "iso-recv",
+            },
+        )
+        check(
+            iso_rereport.get("replayed") is True
+            and iso_rereport["subscription_state"] == "revoked",
+            "re-report after revoke stays idempotent and cannot resurrect the subscription",
+        )
+        iso_trace = trace_of("iso-demo", "revoke-isolation-1")
+        check(
+            iso_trace["subscription"]["state"] == "revoked"
+            and iso_trace["summary"]["persisted_event_count"] == 1
+            and iso_trace["summary"]["server_confirmed"] is False,
+            "revoked terminal state and the single persisted row coexist untouched",
+            iso_trace["summary"],
+        )
+
+        section("11. Lost confirmation response: server state wins after restart")
+        _, lost_ack_req, _ = api.post(
+            "/v1/subscriptions",
+            {
+                "pipeline_id": "lost-ack",
+                "request_id": "lost-ack-1",
+                "asset_id": "harbor-title",
+                "asset_version": "6.0.0",
+                "params": {"case": "lost-ack-response"},
+            },
+        )
+        lost_sub_id = int(lost_ack_req["subscription"]["id"])
+        lost_round = int(lost_ack_req["subscription"]["round_id"])
+        wait_until(
+            lambda: api.get(f"/v1/rounds/{lost_round}")[1]["round"]["state"] == "saved",
+            8,
+            "lost-ack round saved",
+        )
+        _, lost_claim, _ = api.post(
+            "/v1/deliveries/claim",
+            {"pipeline_id": "lost-ack", "receiver_id": "lost-ack-recv", "lease_seconds": 20},
+        )
+        lost_delivery = lost_claim["delivery"]
+        check(int(lost_delivery["subscription_id"]) == lost_sub_id, "claimed lost-ack delivery")
+        # Record the receiver-side persist first, then arm the ack response loss.
+        _, lost_persist, _ = api.post(
+            f"/v1/deliveries/{lost_sub_id}/persisted",
+            {
+                "token": lost_delivery["lease"]["token"],
+                "fence": int(lost_delivery["lease"]["fence"]),
+                "receiver_id": "lost-ack-recv",
+                "sha256": lost_delivery["result"]["sha256"],
+            },
+        )
+        check(lost_persist["ok"] and not lost_persist.get("replayed"), "persist event recorded before the crash")
+        api.post(
+            "/v1/admin/faults/arm",
+            {"fault": "crash_before_ack_response", "match": {"subscription_id": lost_sub_id}},
+        )
+        ack_conn_err = False
+        try:
+            api.post(
+                f"/v1/deliveries/{lost_sub_id}/ack",
+                {"token": lost_delivery["lease"]["token"]},
+            )
+        except (urllib.error.URLError, OSError, TimeoutError, ConnectionError):
+            ack_conn_err = True
+        check(ack_conn_err, "ack response was lost when the server hard-exited")
+        active_server = "server-restarted" if procs.poll("server-restarted") is not None else "server"
+        wait_until(lambda: procs.poll(active_server) is not None, 8, "server exited on ack fault")
+        procs.handles[active_server]["log"].close()
+        time.sleep(0.2)
+        procs.start(
+            "server-ack-restarted",
+            server_argv[0],
+            server_argv[1:],
+        )
+        wait_until(lambda: api.get("/health", timeout=1.5)[1].get("ok"), 15, "server healthy after ack crash")
+
+        # The durable server state is acked even though the client never got
+        # the response; the trace reflects the committed confirmation.
+        check(named_state("lost-ack", "lost-ack-1") == "acked", "server state shows confirmed after lost response")
+        lost_trace = trace_of("lost-ack", "lost-ack-1")
+        check(
+            lost_trace["summary"]["server_confirmed"] is True
+            and lost_trace["summary"]["receiver_persisted"] is True,
+            "trace distinguishes the committed server ack from the receiver persist",
+            lost_trace["summary"],
+        )
+        check(
+            event_types(lost_trace["delivery_events"]).count("delivery_acked") == 1,
+            "exactly one server ack event survived the crash",
+        )
+        check(
+            event_types(lost_trace["delivery_events"]).count("receiver_persisted") == 1,
+            "the pre-handover persist record is retained and still unique",
+        )
+        # Retrying the same ack after restart is the idempotent replay path.
+        _, ack_replay_payload, _ = api.post(
+            f"/v1/deliveries/{lost_sub_id}/ack",
+            {"token": lost_delivery["lease"]["token"]},
+        )
+        check(
+            ack_replay_payload.get("replayed") is True
+            and ack_replay_payload["subscription"]["state"] == "acked",
+            "ack retry after restart returns the durable acked state",
+        )
+        check(
+            event_types(trace_of("lost-ack", "lost-ack-1")["delivery_events"]).count("delivery_acked") == 1,
+            "idempotent ack retry adds no duplicate event",
+        )
+        # The whole investigation trail is still queryable post-restart,
+        # including round-side events created before the first restart.
+        restarted_shared = trace_of("backlog", "shared-0")
+        check(
+            any(e["event_type"] == "result_saved" for e in restarted_shared["round_events"])
+            and "delivery_acked" in event_types(restarted_shared["delivery_events"]),
+            "committed investigation history remains queryable after restarts",
+        )
+
+        section("12. Cumulative write meter")
         _, after_restart_meter, _ = api.get("/v1/metrics/writes")
         before_total = before_restart_meter["meter"]["total"] if "total" in before_restart_meter.get("meter", {}) else before_restart_meter["meter"]
         after_total = after_restart_meter["meter"]
