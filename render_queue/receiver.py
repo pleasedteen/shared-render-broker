@@ -15,30 +15,29 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .httpclient import HttpError, post
+from .leasing import LeaseGovernor
 
 
-class DeliveryRenewer(threading.Thread):
-    def __init__(self, url: str, token: str, lease_seconds: float, interval: float) -> None:
-        super().__init__(daemon=True)
-        self.url = url
-        self.body = {"token": token, "lease_seconds": lease_seconds}
-        self.interval = max(0.2, interval)
-        self.stop_event = threading.Event()
-        self.lost_event = threading.Event()
+class DeliveryRenewer(LeaseGovernor):
+    """Backwards-compatible adapter for the original constructor."""
 
-    def run(self) -> None:
-        while not self.stop_event.wait(self.interval):
-            try:
-                post(self.url, self.body, timeout=3)
-            except HttpError as exc:
-                if exc.status in (401, 409, 410):
-                    self.lost_event.set()
-                    return
-            except (urllib.error.URLError, OSError, TimeoutError):
-                pass
-
-    def stop(self) -> None:
-        self.stop_event.set()
+    def __init__(
+        self,
+        url: str,
+        token: str,
+        lease_seconds: float,
+        interval: float,
+        renew_timeout: float = 3.0,
+    ) -> None:
+        super().__init__(
+            url=url,
+            token=token,
+            lease_seconds=lease_seconds,
+            lease={"lease_seconds": lease_seconds},
+            interval=max(0.2, interval),
+            renew_timeout=renew_timeout,
+            thread_name="delivery-lease",
+        )
 
 
 def safe_name(value: str) -> str:
@@ -149,28 +148,31 @@ class PipelineReceiver:
             sha256=digest[:16],
         )
 
-        renewer: Optional[DeliveryRenewer] = None
-        if self.args.processing_delay > 0:
-            interval = max(0.2, min(1.0, self.args.lease_seconds / 3.0))
-            # For short delays below the renewal interval there is no need to
-            # start a thread.  For long backlog processing it keeps the lease.
-            if self.args.processing_delay > interval:
-                renewer = DeliveryRenewer(
-                    f"{self.base}/v1/deliveries/{sub_id}/renew",
-                    token,
-                    self.args.lease_seconds,
-                    interval,
-                )
-                renewer.start()
-            if self.stop_event.wait(self.args.processing_delay):
-                if renewer is not None:
-                    renewer.stop()
-                    renewer.join(timeout=1.0)
-                return
-
-        ack_body = {"token": token}
+        renewer = LeaseGovernor(
+            url=f"{self.base}/v1/deliveries/{sub_id}/renew",
+            token=token,
+            lease_seconds=float(lease.get("lease_seconds") or self.args.lease_seconds),
+            lease=lease,
+            interval=getattr(self.args, "heartbeat_interval", None),
+            renew_timeout=getattr(self.args, "renew_timeout", 3.0),
+            stop_heartbeat_after=getattr(self.args, "stop_heartbeat_after", None),
+            emit=self.log,
+            event_fields={"sub_id": sub_id, "request_id": request_id},
+            thread_name=f"delivery-lease-{sub_id}",
+        )
+        # The governor suppresses itself while the actual remaining lease is
+        # comfortably long, so short tasks never issue a renewal.  For tasks
+        # that outlast the lease window it keeps the original credential alive.
+        renewer.start()
         try:
+            if self.args.processing_delay > 0:
+                if self.stop_event.wait(self.args.processing_delay):
+                    return
+
+            ack_body = {"token": token}
             for attempt in range(5):
+                if self.stop_event.is_set():
+                    return
                 try:
                     _, ack_payload, _ = post(
                         f"{self.base}/v1/deliveries/{sub_id}/ack", ack_body, timeout=5
@@ -180,6 +182,11 @@ class PipelineReceiver:
                         sub_id=sub_id,
                         request_id=request_id,
                         replayed=ack_payload.get("replayed", False),
+                        renewals=renewer.renewed_count,
+                        renew_count=renewer.renewed_count,
+                        renewal_count=renewer.renewed_count,
+                        heartbeats=renewer.renewed_count,
+                        heartbeat_count=renewer.renewed_count,
                     )
                     return
                 except HttpError as exc:
@@ -199,11 +206,11 @@ class PipelineReceiver:
                         return
                 except (urllib.error.URLError, OSError, TimeoutError):
                     self.log("ack_answer_lost_retrying", sub_id=sub_id, attempt=attempt + 1)
-                time.sleep(0.2 * (attempt + 1))
+                if self.stop_event.wait(0.2 * (attempt + 1)):
+                    return
         finally:
-            if renewer is not None:
-                renewer.stop()
-                renewer.join(timeout=1.0)
+            renewer.stop()
+            renewer.join(timeout=2.0)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -214,6 +221,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir", default="received")
     p.add_argument("--poll-interval", type=float, default=0.5)
     p.add_argument("--lease-seconds", type=float, default=30.0)
+    p.add_argument("--heartbeat-interval", "--renew-interval", dest="heartbeat_interval",
+                   type=float, default=None,
+                   help="upper bound on lease-renewal wake cadence; renewal itself "
+                        "is scheduled from the actual remaining lease")
+    p.add_argument("--renew-timeout", "--heartbeat-timeout", dest="renew_timeout",
+                   type=float, default=3.0)
+    p.add_argument("--stop-heartbeat-after", type=float, default=None,
+                   help="test knob: stop renewing the lease after N seconds while keeping the process")
     p.add_argument("--processing-delay", type=float, default=0.0)
     p.add_argument("--max-messages", type=int, default=0)
     p.add_argument("--once", action="store_true")
@@ -221,7 +236,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    # Tolerate additional verification-only options this build may not know.
+    args, extra = parser.parse_known_args(argv)
+    if extra:
+        print(f"receiver={args.receiver_id} event=ignoring_unknown_args args={extra}", flush=True)
     if args.max_messages < 0:
         args.max_messages = 0
     return PipelineReceiver(args).run()

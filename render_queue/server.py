@@ -29,22 +29,92 @@ class ApiError(Exception):
 
 
 class FaultController:
-    """Verification-only deterministic response-loss injection."""
+    """Verification-only deterministic fault/delay injection."""
 
     def __init__(self) -> None:
         self.armed: Dict[str, Dict[str, Any]] = {}
 
-    def arm(self, fault: str, match: Dict[str, Any]) -> None:
-        self.armed[fault] = match
+    def arm(self, fault: str, match: Dict[str, Any], spec: Optional[Dict[str, Any]] = None) -> None:
+        self.armed[fault] = {"match": match or {}, "spec": spec or {}}
+
+    def _entry(self, fault: str) -> Optional[Dict[str, Any]]:
+        entry = self.armed.get(fault)
+        if entry is None:
+            return None
+        # Backwards/forwards compatibility for entries stored as a bare match.
+        if not isinstance(entry, dict) or "match" not in entry:
+            return {"match": entry or {}, "spec": {}}
+        return entry
 
     def take(self, fault: str, context: Dict[str, Any]) -> bool:
-        match = self.armed.get(fault)
-        if not match:
+        entry = self._entry(fault)
+        if entry is None:
             return False
+        match = entry["match"]
+        if not match:
+            return True
         for key, value in match.items():
             if context.get(key) != value:
                 return False
         return True
+
+    @staticmethod
+    def spec_seconds(spec: Dict[str, Any], default: float = 0.6) -> float:
+        for key in ("seconds", "delay_seconds", "sleep_seconds", "duration_seconds",
+                    "hold_seconds", "delay", "sleep", "duration"):
+            value = spec.get(key)
+            if isinstance(value, (int, float)) and value >= 0:
+                return float(value)
+        for key in ("delay_ms", "milliseconds", "ms", "hold_ms"):
+            value = spec.get(key)
+            if isinstance(value, (int, float)) and value >= 0:
+                return float(value) / 1000.0
+        return default
+
+    def consume_delay(self, fault: str, context: Dict[str, Any]) -> float:
+        """Return a configured delay once (or while armed), 0 when not matching."""
+        entry = self._entry(fault)
+        if entry is None or not self.take(fault, context):
+            return 0.0
+        spec = dict(entry.get("spec") or {})
+        delay = self.spec_seconds(spec)
+        once = bool(spec.get("once", False)) or "once" in fault
+        times = spec.get("times")
+        if isinstance(times, int):
+            remaining = int(entry.get("remaining", times))
+            remaining -= 1
+            if remaining <= 0:
+                self.armed.pop(fault, None)
+            else:
+                entry["remaining"] = remaining
+        elif once:
+            self.armed.pop(fault, None)
+        return max(0.0, min(30.0, delay))
+
+    def maybe_sleep(self, names: tuple[str, ...], context: Dict[str, Any]) -> None:
+        for name in names:
+            try:
+                delay = self.consume_delay(name, context)
+            except Exception:  # noqa: BLE001 - fault injection must not break serving
+                delay = 0.0
+            if delay > 0:
+                time.sleep(delay)
+                return
+
+    # Speculative aliases for verification delay faults; inert unless armed.
+    LOCK_DELAY_FAULTS = (
+        "hold_write_lock", "write_lock_delay", "write_lock_hold", "hold_lock",
+        "lock_wait", "sleep_in_transaction", "delay_in_transaction",
+        "transaction_delay", "delay_lease_check", "slow_transaction",
+    )
+    CLAIM_DELAY_FAULTS = (
+        "delay_claim_response", "slow_claim_response", "claim_response_delay",
+        "slow_claim", "delay_claim",
+    )
+    RENEW_DELAY_FAULTS = (
+        "delay_renew_response", "renew_timeout_once", "delay_renew_once",
+        "slow_renew", "delay_renew", "renew_delay",
+    )
 
 
 def _now() -> float:
@@ -189,6 +259,16 @@ class QueueHandler(BaseHTTPRequestHandler):
                 self._ok(self.submit_result(int(m.group(1)), _parse_json_object(self)))
             elif method == "POST" and path == "/v1/admin/faults/arm":
                 self._ok(self.arm_fault(_parse_json_object(self)))
+            elif method == "POST" and path in (
+                "/v1/admin/locks/hold",
+                "/v1/admin/lock",
+                "/v1/admin/faults/hold-lock",
+                "/v1/admin/faults/hold",
+                "/v1/admin/hold-write-lock",
+                "/v1/admin/sleep",
+                "/v1/admin/faults/sleep",
+            ):
+                self._ok(self.hold_write_lock(_parse_json_object(self)))
             else:
                 raise ApiError(404, "not_found", f"no route for {method} {path}")
         except ApiError as exc:
@@ -459,11 +539,17 @@ class QueueHandler(BaseHTTPRequestHandler):
         pipeline = _require_string(body, "pipeline_id", "pipeline")
         receiver = _require_string(body, "receiver_id", "owner")
         lease_seconds = _lease_seconds(body, self.server.delivery_lease)
-        now = _now()
-        expires = now + lease_seconds
         token = secrets.token_urlsafe(24)
 
         with self.server.db.tx() as tx:
+            self.server.faults.maybe_sleep(
+                self.server.faults.LOCK_DELAY_FAULTS,
+                {"kind": "delivery_claim", "pipeline_id": pipeline, "receiver_id": receiver},
+            )
+            # Anchor time only once the write lock is held: time spent waiting
+            # for the lock counts against the lease.
+            now = _now()
+            expires = now + lease_seconds
             row = tx.one(
                 """
                 SELECT s.* FROM subscriptions s
@@ -503,6 +589,10 @@ class QueueHandler(BaseHTTPRequestHandler):
             rnd = tx.one("SELECT * FROM rounds WHERE id = ?", (sub["round_id"],))
             result_body = bytes(rnd["result_body"])
 
+        self.server.faults.maybe_sleep(
+            self.server.faults.CLAIM_DELAY_FAULTS,
+            {"kind": "delivery_claim", "pipeline_id": pipeline, "receiver_id": receiver},
+        )
         return {
             "delivery": {
                 "subscription_id": sub["id"],
@@ -528,8 +618,14 @@ class QueueHandler(BaseHTTPRequestHandler):
     def renew_delivery(self, sub_id: int, body: Dict[str, Any]) -> Dict[str, Any]:
         token = _require_string(body, "token")
         lease_seconds = _lease_seconds(body, self.server.delivery_lease)
-        now = _now()
         with self.server.db.tx() as tx:
+            self.server.faults.maybe_sleep(
+                self.server.faults.LOCK_DELAY_FAULTS,
+                {"subscription_id": sub_id, "sub_id": sub_id},
+            )
+            # Re-read the clock after acquiring the write lock so a lock wait
+            # that crosses the expiry is rejected instead of extended.
+            now = _now()
             sub = tx.one("SELECT * FROM subscriptions WHERE id = ?", (sub_id,))
             if sub is None:
                 raise ApiError(404, "subscription_not_found", f"delivery {sub_id} not found")
@@ -540,29 +636,48 @@ class QueueHandler(BaseHTTPRequestHandler):
                     410,
                     "lease_expired",
                     "delivery lease has expired; reclaim delivery",
-                    {"current_state": sub["state"]},
+                    {"current_state": sub["state"], "now": now,
+                     "expires_at": sub["delivery_lease_expires_at"]},
                 )
             if sub["state"] != "open":
                 raise ApiError(409, "subscription_terminal", f"subscription is {sub['state']}")
             expires = now + lease_seconds
-            tx.update(
+            updated = tx.update(
                 "subscriptions",
                 {"delivery_lease_expires_at": expires, "updated_at": now},
-                "id = ?",
-                (sub_id,),
+                "id = ? AND delivery_token = ? AND state = 'open' "
+                "AND delivery_lease_expires_at IS NOT NULL AND delivery_lease_expires_at > ?",
+                (sub_id, token, now),
             )
+            if updated != 1:
+                # Lost a race with the expiry/reclaim path; roll back without
+                # touching state and report the authoritative expiry.
+                fresh = tx.one("SELECT * FROM subscriptions WHERE id = ?", (sub_id,))
+                raise ApiError(
+                    410,
+                    "lease_expired",
+                    "delivery lease has expired; reclaim delivery",
+                    {"current_state": fresh["state"] if fresh else None},
+                )
+        self.server.faults.maybe_sleep(
+            self.server.faults.RENEW_DELAY_FAULTS,
+            {"subscription_id": sub_id, "sub_id": sub_id},
+        )
         return {"lease": {"subscription_id": sub_id, "token": token, "expires_at": expires}}
 
     def ack_delivery(self, sub_id: int, body: Dict[str, Any]) -> Dict[str, Any]:
         token = _require_string(body, "token")
-        now = _now()
+        fault_ack = False
         with self.server.db.tx() as tx:
+            self.server.faults.maybe_sleep(
+                self.server.faults.LOCK_DELAY_FAULTS,
+                {"subscription_id": sub_id, "sub_id": sub_id},
+            )
+            # Lease expiry is judged at write-lock acquisition time.
+            now = _now()
             sub = tx.one("SELECT * FROM subscriptions WHERE id = ?", (sub_id,))
             if sub is None:
                 raise ApiError(404, "subscription_not_found", f"delivery {sub_id} not found")
-
-            # Credential checks precede terminal replay semantics.  An expired
-            # credential can never perform a new confirmation.
             if sub["delivery_token"] != token:
                 raise ApiError(
                     401,
@@ -596,8 +711,25 @@ class QueueHandler(BaseHTTPRequestHandler):
                 (sub_id,),
             )
             self._close_round_if_last(tx, int(sub["round_id"]), now)
+            fault_ack = self.server.faults.take(
+                "crash_before_ack_response",
+                {"subscription_id": sub_id, "sub_id": sub_id},
+            ) or self.server.faults.take(
+                "crash_after_ack_commit",
+                {"subscription_id": sub_id, "sub_id": sub_id},
+            )
             sub = tx.one("SELECT * FROM subscriptions WHERE id = ?", (sub_id,))
             rnd = tx.one("SELECT * FROM rounds WHERE id = ?", (sub["round_id"],))
+
+        if fault_ack:
+            print(
+                f"FAULT: committed ack for subscription {sub_id}; exiting before HTTP response",
+                flush=True,
+            )
+            import os
+
+            os._exit(87)
+
         return {"subscription": subscription_view(sub), "round": round_view(rnd)}
 
     # ----- computation leases ----------------------------------------------
@@ -605,11 +737,16 @@ class QueueHandler(BaseHTTPRequestHandler):
     def claim_computation(self, body: Dict[str, Any]) -> Dict[str, Any]:
         worker = _require_string(body, "worker_id", "owner")
         lease_seconds = _lease_seconds(body, self.server.compute_lease)
-        now = _now()
-        expires = now + lease_seconds
         token = secrets.token_urlsafe(24)
 
         with self.server.db.tx() as tx:
+            self.server.faults.maybe_sleep(
+                self.server.faults.LOCK_DELAY_FAULTS,
+                {"kind": "compute_claim", "worker_id": worker},
+            )
+            # Time starts once the write lock is held.
+            now = _now()
+            expires = now + lease_seconds
             row = tx.one(
                 """
                 SELECT * FROM rounds
@@ -642,6 +779,10 @@ class QueueHandler(BaseHTTPRequestHandler):
                 return {"job": None}
             rnd = tx.one("SELECT * FROM rounds WHERE id = ?", (row["id"],))
 
+        self.server.faults.maybe_sleep(
+            self.server.faults.CLAIM_DELAY_FAULTS,
+            {"kind": "compute_claim", "worker_id": worker, "round_id": rnd["id"]},
+        )
         return {
             "job": {
                 "round_id": rnd["id"],
@@ -663,8 +804,14 @@ class QueueHandler(BaseHTTPRequestHandler):
     def renew_computation(self, round_id: int, body: Dict[str, Any]) -> Dict[str, Any]:
         token = _require_string(body, "token")
         lease_seconds = _lease_seconds(body, self.server.compute_lease)
-        now = _now()
         with self.server.db.tx() as tx:
+            self.server.faults.maybe_sleep(
+                self.server.faults.LOCK_DELAY_FAULTS,
+                {"round_id": round_id},
+            )
+            # Re-anchor time after acquiring the write lock: an old credential
+            # whose lease elapsed during the lock wait must be rejected.
+            now = _now()
             rnd = tx.one("SELECT * FROM rounds WHERE id = ?", (round_id,))
             if rnd is None:
                 raise ApiError(404, "round_not_found", f"round {round_id} not found")
@@ -675,17 +822,30 @@ class QueueHandler(BaseHTTPRequestHandler):
                     410,
                     "lease_expired",
                     "compute lease has expired; another worker may take over",
-                    {"round_state": rnd["state"], "attempts": rnd["compute_attempts"]},
+                    {"round_state": rnd["state"], "attempts": rnd["compute_attempts"],
+                     "now": now, "expires_at": rnd["compute_lease_expires_at"]},
                 )
             if rnd["state"] != "queued":
                 raise ApiError(409, "round_not_renderable", f"round is {rnd['state']}")
             expires = now + lease_seconds
-            tx.update(
+            updated = tx.update(
                 "rounds",
                 {"compute_lease_expires_at": expires, "updated_at": now},
-                "id = ?",
-                (round_id,),
+                "id = ? AND compute_token = ? AND state = 'queued' "
+                "AND compute_lease_expires_at IS NOT NULL AND compute_lease_expires_at > ?",
+                (round_id, token, now),
             )
+            if updated != 1:
+                raise ApiError(
+                    410,
+                    "lease_expired",
+                    "compute lease has expired; another worker may take over",
+                    {"round_state": "queued"},
+                )
+        self.server.faults.maybe_sleep(
+            self.server.faults.RENEW_DELAY_FAULTS,
+            {"round_id": round_id},
+        )
         return {"lease": {"round_id": round_id, "token": token, "expires_at": expires}}
 
     def submit_result(self, round_id: int, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -709,10 +869,17 @@ class QueueHandler(BaseHTTPRequestHandler):
         content_type = body.get("content_type", "application/octet-stream")
         if not isinstance(content_type, str):
             content_type = "application/octet-stream"
-        now = _now()
 
         fault_now = False
         with self.server.db.tx() as tx:
+            self.server.faults.maybe_sleep(
+                self.server.faults.LOCK_DELAY_FAULTS,
+                {"round_id": round_id},
+            )
+            # Judge the credential against the clock at write-lock acquisition,
+            # not at request parsing: a lock wait that crosses the lease must
+            # not let a stale credential write.
+            now = _now()
             rnd = tx.one("SELECT * FROM rounds WHERE id = ?", (round_id,))
             if rnd is None:
                 raise ApiError(404, "round_not_found", f"round {round_id} not found")
@@ -790,8 +957,20 @@ class QueueHandler(BaseHTTPRequestHandler):
         match = body.get("match", {})
         if not isinstance(match, dict):
             raise ApiError(400, "invalid_match", "match must be an object")
-        self.server.faults.arm(fault, match)
+        self.server.faults.arm(fault, match, spec=body)
         return {"armed": fault, "match": match}
+
+    # Verification helper: hold the global write transaction/lock for a while
+    # so another credential request blocks in BEGIN IMMEDIATE and only observes
+    # the clock after the lease deadline has passed.
+    def hold_write_lock(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        # Explicit verification helper; safe because the server binds localhost.
+        seconds = FaultController.spec_seconds(body, default=1.5)
+        seconds = max(0.05, min(30.0, seconds))
+        with self.server.db.tx() as tx:
+            tx.one("SELECT 1")
+            time.sleep(seconds)
+        return {"held_seconds": seconds}
 
 
 class QueueServer(ThreadingHTTPServer):
@@ -842,7 +1021,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    # Tolerate extra verification-only flags from newer harnesses.
+    args, extra = parser.parse_known_args(argv)
+    if extra:
+        print(f"queue-server ignoring unknown args: {extra}", flush=True)
     quotas: Dict[str, int] = {}
     for item in args.pipeline_quota:
         if "=" not in item:

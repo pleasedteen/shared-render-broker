@@ -168,6 +168,9 @@ class Database:
             str(self.path),
             check_same_thread=False,
             isolation_level=None,
+            # Verification may hold an external write lock across a short lease;
+            # wait politely rather than failing the BEGIN IMMEDIATE at 5s.
+            timeout=30.0,
         )
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")

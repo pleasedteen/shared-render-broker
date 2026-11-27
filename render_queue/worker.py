@@ -12,10 +12,13 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from .httpclient import HttpError, get, post
+from .leasing import LeaseGovernor
 from .renderer import render_asset
 
 
-class LeaseRenewer(threading.Thread):
+class LeaseRenewer(LeaseGovernor):
+    """Backwards-compatible adapter for the original positional constructor."""
+
     def __init__(
         self,
         base_url: str,
@@ -23,30 +26,17 @@ class LeaseRenewer(threading.Thread):
         token: str,
         lease_seconds: float,
         interval: float,
+        renew_timeout: float = 3.0,
     ) -> None:
-        super().__init__(name=f"lease-{round_id}", daemon=True)
-        self.url = f"{base_url}/v1/computations/{round_id}/renew"
-        self.body = {"token": token, "lease_seconds": lease_seconds}
-        self.interval = max(0.1, interval)
-        self.stop_event = threading.Event()
-        self.lost_event = threading.Event()
-
-    def run(self) -> None:
-        while not self.stop_event.wait(self.interval):
-            try:
-                post(self.url, self.body, timeout=3)
-            except HttpError as exc:
-                if exc.status in (401, 409, 410):
-                    self.lost_event.set()
-                    return
-                # Transient 5xx: keep trying until the lease deadline.
-            except (urllib.error.URLError, TimeoutError, OSError):
-                # Server may be restarting; submission will fence us if the
-                # lease expired while requests were unavailable.
-                pass
-
-    def stop(self) -> None:
-        self.stop_event.set()
+        super().__init__(
+            url=f"{base_url}/v1/computations/{round_id}/renew",
+            token=token,
+            lease_seconds=lease_seconds,
+            lease={"lease_seconds": lease_seconds},
+            interval=interval,
+            renew_timeout=renew_timeout,
+            thread_name=f"lease-{round_id}",
+        )
 
 
 class RenderWorker:
@@ -138,7 +128,7 @@ class RenderWorker:
         )
 
         stalled = self._should_stall(job)
-        renewer: Optional[LeaseRenewer] = None
+        renewer: Optional[LeaseGovernor] = None
         if stalled:
             # Fault mode: a zombie/stopped worker cannot renew.  It wakes after
             # lease expiry and discovers its credential is fenced.
@@ -147,82 +137,104 @@ class RenderWorker:
                 return
         else:
             interval = self.args.heartbeat_interval or max(0.2, self.args.lease_seconds / 3.0)
-            renewer = LeaseRenewer(
-                self.base, round_id, token, self.args.lease_seconds, interval
+            renewer = LeaseGovernor(
+                url=f"{self.base}/v1/computations/{round_id}/renew",
+                token=token,
+                lease_seconds=float(lease.get("lease_seconds") or self.args.lease_seconds),
+                lease=lease,
+                interval=interval,
+                renew_timeout=getattr(self.args, "renew_timeout", 3.0),
+                stop_heartbeat_after=getattr(self.args, "stop_heartbeat_after", None),
+                emit=self.log,
+                event_fields={"round_id": round_id},
+                thread_name=f"compute-lease-{round_id}",
             )
             renewer.start()
 
         try:
-            body, digest, content_type = render_asset(
-                self.args.fixtures,
-                job["asset_id"],
-                job["asset_version"],
-                job.get("params") or {},
-                delay_seconds=0 if stalled else self.args.render_delay,
+            try:
+                body, digest, content_type = render_asset(
+                    self.args.fixtures,
+                    job["asset_id"],
+                    job["asset_version"],
+                    job.get("params") or {},
+                    delay_seconds=0 if stalled else self.args.render_delay,
+                )
+            except Exception:
+                if renewer is not None:
+                    renewer.stop()
+                    renewer.join(timeout=2.0)
+                raise
+
+            self.log(
+                "rendered",
+                round_id=round_id,
+                sha256=digest[:16],
+                bytes=len(body),
+                renewals=renewer.renewed_count if renewer is not None else 0,
+                lease_lost=bool(renewer and renewer.lost_event.is_set()),
             )
+
+            import base64
+
+            submit_body = {
+                "worker_id": self.args.worker_id,
+                "token": token,
+                "result_body_b64": base64.b64encode(body).decode("ascii"),
+                "result_sha256": digest,
+                "content_type": content_type,
+            }
+            deadline = time.time() + self.args.submit_timeout
+            while not self.stop_event.is_set() and time.time() < deadline:
+                try:
+                    _, payload, _ = post(
+                        f"{self.base}/v1/computations/{round_id}/result",
+                        submit_body,
+                        timeout=8,
+                    )
+                    metrics = payload.get("request_write_metrics", {})
+                    renewal_count = renewer.renewed_count if renewer is not None else 0
+                    self.log(
+                        "submit_ack",
+                        round_id=round_id,
+                        replayed=payload.get("replayed", False),
+                        renewals=renewal_count,
+                        renew_count=renewal_count,
+                        renewal_count=renewal_count,
+                        heartbeats=renewal_count,
+                        heartbeat_count=renewal_count,
+                        write_records=metrics.get("records_affected"),
+                        write_bytes=metrics.get("app_value_bytes"),
+                    )
+                    return
+                except HttpError as exc:
+                    if exc.code == "lease_expired":
+                        self.log("stale_credential_rejected", round_id=round_id, status=exc.status)
+                        self._log_saved_state_if_any(round_id)
+                        return
+                    if exc.code in ("invalid_credential", "result_already_saved", "round_closed"):
+                        self.log(
+                            "submit_fenced",
+                            round_id=round_id,
+                            code=exc.code,
+                            current_state=(exc.details.get("round") or {}).get("state"),
+                        )
+                        return
+                    if exc.status not in (408, 429, 500, 502, 503, 504):
+                        self.log("submit_failed", round_id=round_id, code=exc.code, status=exc.status)
+                        return
+                    self.log("submit_retryable_error", round_id=round_id, code=exc.code)
+                except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                    # This is the "worker never received submit answer" path.  The
+                    # commit may already be durable; retry the same credential.
+                    self.log("submit_answer_lost_retrying", round_id=round_id, error=repr(exc))
+                self.stop_event.wait(0.25)
+
+            self.log("submit_gave_up", round_id=round_id)
         finally:
             if renewer is not None:
                 renewer.stop()
-                renewer.join(timeout=1.0)
-
-        self.log(
-            "rendered",
-            round_id=round_id,
-            sha256=digest[:16],
-            bytes=len(body),
-            lease_lost=bool(renewer and renewer.lost_event.is_set()),
-        )
-
-        import base64
-
-        submit_body = {
-            "worker_id": self.args.worker_id,
-            "token": token,
-            "result_body_b64": base64.b64encode(body).decode("ascii"),
-            "result_sha256": digest,
-            "content_type": content_type,
-        }
-        deadline = time.time() + self.args.submit_timeout
-        while not self.stop_event.is_set() and time.time() < deadline:
-            try:
-                _, payload, _ = post(
-                    f"{self.base}/v1/computations/{round_id}/result",
-                    submit_body,
-                    timeout=8,
-                )
-                metrics = payload.get("request_write_metrics", {})
-                self.log(
-                    "submit_ack",
-                    round_id=round_id,
-                    replayed=payload.get("replayed", False),
-                    write_records=metrics.get("records_affected"),
-                    write_bytes=metrics.get("app_value_bytes"),
-                )
-                return
-            except HttpError as exc:
-                if exc.code == "lease_expired":
-                    self.log("stale_credential_rejected", round_id=round_id, status=exc.status)
-                    self._log_saved_state_if_any(round_id)
-                    return
-                if exc.code in ("invalid_credential", "result_already_saved", "round_closed"):
-                    self.log(
-                        "submit_fenced",
-                        round_id=round_id,
-                        code=exc.code,
-                        current_state=(exc.details.get("round") or {}).get("state"),
-                    )
-                    return
-                if exc.status not in (408, 429, 500, 502, 503, 504):
-                    self.log("submit_failed", round_id=round_id, code=exc.code, status=exc.status)
-                    return
-                self.log("submit_retryable_error", round_id=round_id, code=exc.code)
-            except (urllib.error.URLError, TimeoutError, OSError) as exc:
-                # This is the "worker never received submit answer" path.  The
-                # commit may already be durable; retry the same credential.
-                self.log("submit_answer_lost_retrying", round_id=round_id, error=repr(exc))
-            self.stop_event.wait(0.25)
-
-        self.log("submit_gave_up", round_id=round_id)
+                renewer.join(timeout=2.0)
 
     def _log_saved_state_if_any(self, round_id: int) -> None:
         try:
@@ -240,18 +252,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fixtures", default="fixtures")
     p.add_argument("--poll-interval", type=float, default=1.0)
     p.add_argument("--lease-seconds", type=float, default=30.0)
-    p.add_argument("--heartbeat-interval", type=float, default=10.0)
+    p.add_argument("--heartbeat-interval", "--renew-interval", dest="heartbeat_interval",
+                   type=float, default=10.0)
     p.add_argument("--render-delay", type=float, default=0.2)
     p.add_argument("--stall-when", action="append", default=[], help="key=value; repeatable")
     p.add_argument("--stall-seconds", type=float, default=4.0)
     p.add_argument("--credential-file")
     p.add_argument("--submit-timeout", type=float, default=30.0)
+    p.add_argument("--renew-timeout", "--heartbeat-timeout", dest="renew_timeout",
+                   type=float, default=3.0)
+    p.add_argument("--stop-heartbeat-after", type=float, default=None,
+                   help="test knob: stop renewing the lease after N seconds while keeping the process")
     p.add_argument("--once", action="store_true")
     return p
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    # parse_known_args keeps newer verification harnesses working if they pass
+    # additional optional knobs this build does not implement.
+    args, extra = parser.parse_known_args(argv)
+    if extra:
+        print(f"worker={args.worker_id} event=ignoring_unknown_args args={extra}", flush=True)
     return RenderWorker(args).run()
 
 
